@@ -11,6 +11,30 @@ from mcp.server.fastmcp import FastMCP
 
 from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
+# --- curl_cffi -> plain requests patch --------------------------------------
+# garminconnect's Client._http_post prefers curl_cffi (Chrome TLS-fingerprint
+# impersonation) when it's installed. Behind a TLS-terminating proxy — e.g. a
+# cloud sandbox — that impersonated handshake is frequently killed mid-flight
+# with "Recv failure: Connection reset by peer", which breaks token refresh in
+# _refresh_di_token() / _exchange_service_ticket(). Plain requests uses the
+# standard TLS stack and is far more reliable in those environments, so we
+# monkey-patch the method to always go through requests.post. requests is
+# already a declared dependency, so this adds nothing new.
+import garminconnect.client as _gc_client
+
+
+def _http_post_via_requests(self, url, **kwargs):
+    """強制走 plain requests，不用 curl_cffi 的 TLS 指紋偽裝。
+
+    在雲端 sandbox 這種會重新終止 TLS 的 proxy 環境下，curl_cffi
+    常被 Recv failure: Connection reset by peer 打斷；plain requests
+    走標準 TLS，穩定很多。"""
+    return requests.post(url, **kwargs)
+
+
+_gc_client.Client._http_post = _http_post_via_requests
+# ---------------------------------------------------------------------------
+
 # Import all modules
 from garmin_mcp import activity_management
 from garmin_mcp import health_wellness
@@ -237,7 +261,7 @@ def init_api(email, password):
         finally:
             sys.stderr = old_stderr
 
-    except (FileNotFoundError, GarminConnectConnectionError, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError):
+    except (FileNotFoundError, GarminConnectConnectionError, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError) as _login_err:
         # Session is expired. You'll need to log in again
 
         # Check if we're in a non-interactive environment without credentials
@@ -248,7 +272,8 @@ def init_api(email, password):
                 "  1. Run: garmin-mcp-auth\n"
                 "  2. Enter your credentials and MFA code\n"
                 "  3. Restart your MCP client\n"
-                f"Tokens will be saved to: {tokenstore}\n",
+                f"Tokens will be saved to: {tokenstore}\n"
+                f"  (underlying error: {_login_err})\n",
                 file=sys.stderr,
             )
             return None
